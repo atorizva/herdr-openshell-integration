@@ -433,7 +433,7 @@ test("a vanished sandbox releases its agent row once and never closes the pane",
   await pollOnce({ exec, trackedPath });
   assert.ok(
     exec.calls.includes(
-      "herdr pane release-agent w1:p3 --source openshell --agent opencode",
+      "herdr pane release-agent w1:p3 --source openshell --agent opencode --seq 2",
     ),
     "the agent row is released",
   );
@@ -457,6 +457,36 @@ test("a Deleting sandbox releases its agent row", async () => {
   assert.equal(count(exec.calls, "release-agent"), 1);
   assert.equal(count(exec.calls, "pane close"), 0, "the user's pane is never closed");
   assert.deepEqual(JSON.parse(fs.readFileSync(trackedPath, "utf8")), {});
+});
+
+test("detaching the connect session releases the row but keeps the sandbox tracked", async () => {
+  const trackedPath = path.join(tmpDir(), "tracked.json");
+  const sandboxes = () => [{ id: "sb1", name: "agent-one", phase: "Ready", exit_code: null }];
+  const connectPanes = { "agent-one": "w1:p3" };
+  const exec = fakeExec({ sandboxes, connectPanes });
+  await pollOnce({ exec, trackedPath });
+  assert.deepEqual(reports(exec.calls), [
+    `herdr pane report-agent w1:p3 --source openshell --agent opencode --state working --seq 1`,
+  ]);
+
+  // The user detached: the ssh in the pane is gone, so detection finds no connect session.
+  exec.calls.length = 0;
+  delete connectPanes["agent-one"];
+  await pollOnce({ exec, trackedPath });
+  assert.ok(
+    exec.calls.includes("herdr pane release-agent w1:p3 --source openshell --agent opencode --seq 2"),
+    "the agent row is released when the connect session ends",
+  );
+  assert.equal(count(exec.calls, "report-agent"), 0, "no report while detached");
+  const tracked = JSON.parse(fs.readFileSync(trackedPath, "utf8"));
+  assert.equal(tracked.sb1.paneId, null, "the pane is forgotten but the sandbox is kept");
+
+  // Re-attach in a new pane: the kept entry resumes (seq 3, not a fresh seq 1).
+  const reconnect = fakeExec({ sandboxes, connectPanes: { "agent-one": "w1:p9" } });
+  await pollOnce({ exec: reconnect, trackedPath });
+  assert.deepEqual(reports(reconnect.calls), [
+    `herdr pane report-agent w1:p9 --source openshell --agent opencode --state working --seq 3`,
+  ]);
 });
 
 test("stop's transient Error flashes are debounced into paused", async () => {
@@ -515,6 +545,7 @@ test("reads the marker file and reports the highest seq, not the last line", asy
   // Connect replays the file, so lines repeat and need not arrive in seq order.
   const exec = fakeExec({
     sandboxes: () => [{ id: "sb1", name: "agent-one", phase: "Ready", exit_code: null }],
+    connectPanes: { "agent-one": "w1:p3" },
     markers: () => marker("working", 20) + marker("idle", 30) + marker("working", 20),
   });
   await pollOnce({ exec, trackedPath });
@@ -529,6 +560,7 @@ test("a permission prompt inside the sandbox reports blocked/needs input", async
   seedTracked(trackedPath);
   const exec = fakeExec({
     sandboxes: () => [{ id: "sb1", name: "agent-one", phase: "Ready", exit_code: null }],
+    connectPanes: { "agent-one": "w1:p3" },
     markers: () => marker("working", 100) + marker("blocked", 101),
   });
   await pollOnce({ exec, trackedPath });
@@ -545,6 +577,7 @@ test("each new marker overrides the lifecycle state while the sandbox runs", asy
   let text = marker("blocked", 10);
   const exec = fakeExec({
     sandboxes: () => [{ id: "sb1", name: "agent-one", phase: "Ready", exit_code: null }],
+    connectPanes: { "agent-one": "w1:p3" },
     markers: () => text,
   });
   await pollOnce({ exec, trackedPath });

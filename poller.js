@@ -225,9 +225,10 @@ async function detectPanes(exec) {
 }
 
 // The pane is the user's own (we never split one), so releasing the agent row is all we ever
-// do - closing it would destroy the user's terminal.
-async function releasePane(exec, paneId) {
-  await exec(HERDR, ["pane", "release-agent", paneId, ...IDENTITY]);
+// do - closing it would destroy the user's terminal. `--seq` must be strictly newer than the
+// pane's last report-agent seq or Herdr ignores the release, so callers bump `entry.seq` first.
+async function releasePane(exec, paneId, seq) {
+  await exec(HERDR, ["pane", "release-agent", paneId, ...IDENTITY, "--seq", String(seq)]);
 }
 
 // ticket 03: `openshell sandbox list -o json` -> diff against tracked sandboxes ->
@@ -247,7 +248,10 @@ async function pollOnce({ exec = run, trackedPath = TRACKED_PATH } = {}) {
     const sandbox = live.get(id);
     if (sandbox && sandbox.phase !== "Deleting") continue;
     // Deleting, or gone from `list` entirely: the sandbox is being removed.
-    await releasePane(exec, entry.paneId);
+    if (entry.paneId) {
+      entry.seq += 1;
+      await releasePane(exec, entry.paneId, entry.seq);
+    }
     delete tracked[id];
   }
 
@@ -275,12 +279,32 @@ async function pollOnce({ exec = run, trackedPath = TRACKED_PATH } = {}) {
         // plugin upload acknowledged by the sandbox.
         installed: false,
       };
-    } else if (connectPanes.get(sandbox.name) && connectPanes.get(sandbox.name) !== entry.paneId) {
-      // The user reconnected in a different pane: move the row there.
-      await releasePane(exec, entry.paneId);
-      entry.paneId = connectPanes.get(sandbox.name);
-      entry.state = null; // force a fresh report on the new pane
-      entry.message = null;
+    } else {
+      const paneId = connectPanes.get(sandbox.name);
+      if (!paneId) {
+        // The connect session ended (the user detached, or the main process exited) while the
+        // sandbox is still live: no agent is running in the pane anymore, so release the row.
+        // Keep the entry so a reconnect resumes the marker stream (and a `blocked` state
+        // written while detached) instead of re-baselining the marker file.
+        if (entry.paneId) {
+      entry.seq += 1;
+      await releasePane(exec, entry.paneId, entry.seq);
+    }
+        entry.paneId = null;
+        entry.state = null;
+        entry.message = null;
+        continue;
+      }
+      if (paneId !== entry.paneId) {
+        // The user reconnected in a different pane (or a new one after detaching): move the row.
+        if (entry.paneId) {
+      entry.seq += 1;
+      await releasePane(exec, entry.paneId, entry.seq);
+    }
+        entry.paneId = paneId;
+        entry.state = null; // force a fresh report on the new pane
+        entry.message = null;
+      }
     }
     if (!entry.installed && RUNNING_PHASES.has(sandbox.phase)) {
       entry.installed = await uploadPlugin(exec, sandbox.name);
