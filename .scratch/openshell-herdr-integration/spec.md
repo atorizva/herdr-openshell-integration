@@ -6,9 +6,10 @@ they ran on the host".
 
 ## Model
 
-One OpenShell **sandbox** = one **opencode** agent = one Herdr **pane**. The sandbox's
-*main process* is opencode, so `openshell sandbox connect <name>` lands directly in the
-agent and OpenShell's `exit_code` / `phase` genuinely reflect it.
+One OpenShell **sandbox** = one **opencode** agent = one Herdr **pane** — but the pane is the
+*user's own*, the one they ran `openshell sandbox connect <name>` in, never a pane the plugin
+creates. The sandbox's *main process* is opencode, so `connect` lands directly in the agent
+and OpenShell's `exit_code` / `phase` genuinely reflect it.
 
 ## Decisions (agreed)
 
@@ -16,15 +17,16 @@ agent and OpenShell's `exit_code` / `phase` genuinely reflect it.
 2. **Agent** — opencode only.
 3. **Fidelity** — full cognitive state (`working` / `done` / `needs input`) is the target;
    lifecycle mapping is milestone 1.
-4. **Scope** — general: every OpenShell sandbox automatically appears in Herdr.
+4. **Scope** — general: every OpenShell sandbox appears in Herdr once the user connects to
+   it (a running-but-unconnected sandbox has no pane to report to, so no row).
 5. **Glue** — a Herdr plugin.
 6. **"Needs input"** — an in-sandbox opencode plugin + a host-side reader; validate Herdr's
    built-in opencode screen-detection first as a free win.
 7. **Launch model** — sandbox = agent (opencode as main process/workload).
-8. **Identity** — report `agent: "opencode"` with `source: "openshell"`; name each pane
-   after its sandbox (keeps opencode semantics; distinguishes via pane name).
-9. **Removal** — sandbox deleted ⇒ close its pane; sandbox stopped/suspended ⇒ keep the
-   pane, report `done(paused)` so it can be resumed.
+8. **Identity** — report `agent: "opencode"` with `source: "openshell"`; the pane is the
+   user's own (identified by its connect session, not renamed by the plugin).
+9. **Removal** — sandbox deleted / gone ⇒ release the agent row; never close the user's
+   pane. Sandbox stopped/suspended ⇒ keep reporting `done(paused)` so it can be resumed.
 
 ## Architecture
 
@@ -35,8 +37,9 @@ A Herdr plugin (`herdr-plugin.toml`) acts as the bridge. There is no plugin SDK:
 - **`[[startup]]`** spawns a detached poller (Node) that loops; Herdr does not supervise or
   reap descendants, so the plugin owns lifecycle and re-spawns on every server start.
 - **Poller loop (~5s):** `openshell sandbox list -o json` → diff against tracked sandboxes →
-  for a new sandbox `herdr pane split` + `pane run "<id>" "openshell sandbox connect <name>"`;
-  for a vanished sandbox, clean up.
+  detect the pane each sandbox is connected to via `herdr pane process-info` (the connect
+  session's `ssh`/`ssh-proxy` argv carries the sandbox name), then report state to that pane;
+  for a vanished sandbox, release the agent row.
 - **Lifecycle state** is reported via `pane.report_agent`
   (`herdr pane report-agent <pane_id> --source openshell --agent opencode --state …`).
 - **"Needs input"** is read by the poller from the pane via socket `events.subscribe
@@ -66,14 +69,15 @@ enum values finalized against the live API during M1.
 
 ### M2 — "needs input"
 
-Reuse the existing opencode integration's event→state map, emitted to stdout by the
-in-sandbox plugin and translated by the poller:
+Reuse the existing opencode integration's event→state map, emitted to the marker file by the
+in-sandbox plugin and translated by the poller. This is the **v2** event map (v1 hooks do not
+run in opencode v2.x):
 
-| opencode event | Herdr state |
+| opencode v2 event | Herdr state |
 |---|---|
-| `permission.asked`, `question.asked`, `session.error` | `blocked` |
-| `session.status` active/busy/running, `tool.execute.*` | `working` |
-| `session.idle` | `idle` |
+| `permission.asked`, `form.created`, `session.execution.failed` | `blocked` |
+| `session.execution.started`, `session.step.*`, `session.tool.called`, `session.retry.scheduled`, `permission.replied`, `form.replied`, `form.cancelled` | `working` |
+| `session.execution.succeeded`, `session.execution.interrupted` | `idle` |
 
 ## Deliverables
 
@@ -88,4 +92,5 @@ in-sandbox plugin and translated by the poller:
   per sandbox. First implementation spike.
 - **`sandbox connect` attach/replay** not yet verified against the live gateway.
 - **Detached poller** is unsupervised — re-spawn on server start + self-heal required.
-- **Detached sandbox** reports lifecycle-only ("needs input" requires an attached pane).
+- **Detached sandbox** reports lifecycle-only ("needs input" requires the connect pane; a
+  sandbox never connected to has no row at all).
