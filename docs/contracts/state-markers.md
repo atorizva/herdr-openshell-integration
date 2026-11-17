@@ -50,7 +50,8 @@ pane to `idle` while the root agent is still working.
 
 - Read the file on each poll, then keep only markers whose `seq` is greater than the last one
   seen for that sandbox: the file is append-only across `stop`/`start`, so old markers are still
-  there.
+  there. On the **first** sight of a sandbox, adopt the highest `seq` in the file as the baseline
+  and report nothing — that file is a previous run's news.
 - A missing file, an empty file or a sandbox that cannot be `exec`ed is not an error — markers
   only exist while the agent inside is running; M1 lifecycle mapping still applies.
 - Report with `herdr pane report-agent … --state <idle|working|blocked>`; nothing else is
@@ -62,7 +63,8 @@ pane to `idle` while the root agent is still working.
 ## Install
 
 `--upload` cannot be combined with a trailing main-process command, so upload **after** create
-(the file survives `sandbox stop` → `start`):
+(the file survives `sandbox stop` → `start`). The poller does this for every sandbox it first
+sees, best effort, and retries on later ticks until the sandbox accepts it:
 
 ```bash
 openshell sandbox upload <name> ./herdr-state-plugin.js /sandbox/.config/opencode/plugins/

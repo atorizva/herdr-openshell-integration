@@ -54,12 +54,18 @@ Rules:
 - `stop` passes through a transient `Error`/`Stopping` with `exit_code 143`: require an `Error`
   to persist to the next poll before reporting `blocked`.
 - Send `--seq` strictly increasing per pane; on pane removal, `herdr pane release-agent`.
+- A non-zero `report-agent` exit is **not** proof the pane is gone: confirm with
+  `herdr pane get <pane_id>` (`error.code == "pane_not_found"`) and only then drop tracking.
+  Any other failure is transient — retry the same report next tick rather than splitting a
+  second pane for the same sandbox.
 - Never re-spawn `connect` for a `Completed`/`Error` sandbox — its main process is gone and
   `connect` fails immediately.
 
 ## 3. Pane command
 
-`herdr pane split` + `herdr pane run "<id>" "openshell sandbox connect <name>"`.
+`herdr pane split` + `herdr pane rename "<id>" "<sandbox name>"` +
+`herdr pane run "<id>" "openshell sandbox connect <name>"` (spec decision 8: the pane is
+named after its sandbox; `pane rename` is the CLI's label setter, `PaneInfo.label`).
 
 `connect` attaches to the sandbox's **canonical main process** (`ssh -tt … -s sandbox
 openshell-main`), not to a new shell:
@@ -94,10 +100,11 @@ Verified live: `-- opencode --version` ⇒ phase `Completed`, `exit_code 0`
 opencode TUI. The default `nvcr.io/nvidia/base/ubuntu:24.04` image has no opencode.
 
 The in-sandbox state plugin (M2) is uploaded **after** create, because `--upload` cannot be
-combined with a trailing command:
+combined with a trailing command. The poller does it automatically for each sandbox it first
+sees (best effort, retried):
 
 ```bash
-openshell sandbox upload <name> ./herdr-state-plugin.js /sandbox/.config/opencode/plugin/
+openshell sandbox upload <name> ./herdr-state-plugin.js /sandbox/.config/opencode/plugins/
 ```
 
 (`HOME=/sandbox`, read-write; the file survives `stop` → `start`.) Baking it into the image works
