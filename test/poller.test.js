@@ -7,6 +7,9 @@ const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
 
+// These tests run in-process, so poller.js's module-load env reads must be pinned: a live
+// Herdr pane exports HERDR_BIN_PATH etc., which would otherwise point HERDR at the real bin.
+process.env.HERDR_BIN_PATH = "herdr";
 const { mapPhase, pollOnce } = require("../poller.js");
 
 const REPO = path.join(__dirname, "..");
