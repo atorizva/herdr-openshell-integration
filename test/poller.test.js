@@ -7,6 +7,8 @@ const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
 
+const { mapPhase, pollOnce } = require("../poller.js");
+
 const REPO = path.join(__dirname, "..");
 const POLLER = path.join(REPO, "poller.js");
 
@@ -27,11 +29,21 @@ const alive = (pid) => {
     return false;
   }
 };
-const pollerEnv = (stateDir) => ({
-  ...process.env,
-  HERDR_PLUGIN_STATE_DIR: stateDir,
-  HERDR_OPENSHELL_POLL_MS: "50",
-});
+// Stub openshell/herdr on PATH so a spawned loop never touches the real gateway or Herdr.
+const pollerEnv = (stateDir) => {
+  const bin = path.join(stateDir, "bin");
+  fs.mkdirSync(bin, { recursive: true });
+  fs.writeFileSync(path.join(bin, "openshell"), '#!/bin/sh\necho \'{"sandboxes":[]}\'\n');
+  fs.writeFileSync(path.join(bin, "herdr"), "#!/bin/sh\nexit 1\n");
+  for (const file of ["openshell", "herdr"]) fs.chmodSync(path.join(bin, file), 0o755);
+  return {
+    ...process.env,
+    PATH: `${bin}:${process.env.PATH}`,
+    HERDR_BIN_PATH: path.join(bin, "herdr"),
+    HERDR_PLUGIN_STATE_DIR: stateDir,
+    HERDR_OPENSHELL_POLL_MS: "50",
+  };
+};
 const startPoller = (stateDir, args = []) =>
   spawn(process.execPath, [POLLER, ...args], { env: pollerEnv(stateDir), stdio: "ignore" });
 const waitFor = async (fn, ms = 10000) => {
@@ -124,4 +136,163 @@ test("manifest parses as a Herdr plugin", (t) => {
   const entry = registry.find((p) => p.plugin_id === "herdr-openshell");
   assert.ok(entry, "plugin registered");
   assert.deepEqual(entry.startup, [{ command: ["node", "poller.js", "--detach"] }]);
+});
+
+test("maps every sandbox phase onto a Herdr agent state", () => {
+  const ready = { phase: "Ready", exit_code: null };
+  for (const phase of ["Provisioning", "Starting", "Ready"]) {
+    assert.deepEqual(mapPhase({ ...ready, phase }), { state: "working" }, phase);
+  }
+  assert.deepEqual(mapPhase({ phase: "Completed", exit_code: 0 }), { state: "idle" });
+  assert.deepEqual(mapPhase({ phase: "Error", exit_code: 7, conditions: [] }), {
+    state: "blocked",
+    message: "exit code 7",
+  });
+  assert.deepEqual(
+    mapPhase({
+      phase: "Error",
+      exit_code: null,
+      conditions: [{ reason: "ProvisioningTimedOut" }],
+    }),
+    { state: "blocked", message: "ProvisioningTimedOut" },
+  );
+  // Phase wins over exit code: a stopped sandbox keeps its 143 without going blocked.
+  for (const phase of ["Stopping", "Stopped", "Suspending", "Suspended"]) {
+    assert.deepEqual(mapPhase({ phase, exit_code: 143 }), {
+      state: "idle",
+      message: `paused: sandbox ${phase}`,
+    });
+  }
+  assert.equal(mapPhase({ phase: "Deleting", exit_code: null }), null);
+  for (const phase of ["Unspecified", "Unknown"]) {
+    assert.deepEqual(mapPhase({ phase, exit_code: null }), { state: "unknown" });
+  }
+});
+
+// Fake subprocesses: a scripted `openshell`/`herdr`, recording every argv line.
+const fakeExec = ({ sandboxes, panes = [{ pane_id: "w1:p1", focused: true }] }) => {
+  const calls = [];
+  let splits = 0;
+  const ok = (payload) => ({
+    code: 0,
+    stdout: typeof payload === "string" ? payload : JSON.stringify(payload),
+    stderr: "",
+  });
+  const exec = async (command, args) => {
+    const line = [command, ...args].join(" ");
+    calls.push(line);
+    if (line === "openshell sandbox list -o json") return ok({ sandboxes: sandboxes() });
+    if (line === "herdr pane list") return ok({ result: { panes } });
+    if (args[0] === "pane" && args[1] === "split") {
+      splits += 1;
+      return ok({ result: { pane: { pane_id: `w1:p${splits + 2}` } } });
+    }
+    return ok();
+  };
+  exec.calls = calls;
+  return exec;
+};
+const count = (calls, needle) => calls.filter((call) => call.includes(needle)).length;
+
+test("a new sandbox becomes one pane running connect, reported as working", async () => {
+  const trackedPath = path.join(tmpDir(), "tracked.json");
+  const exec = fakeExec({
+    sandboxes: () => [{ id: "sb1", name: "agent-one", phase: "Ready", exit_code: null }],
+  });
+  await pollOnce({ exec, trackedPath });
+
+  assert.equal(count(exec.calls, "pane split"), 1, "one split per sandbox");
+  assert.ok(exec.calls.includes("herdr pane run w1:p3 openshell sandbox connect agent-one"));
+  const reports = exec.calls.filter((call) => call.includes("report-agent"));
+  assert.deepEqual(reports, [
+    `herdr pane report-agent w1:p3 --source openshell --agent opencode --state working --seq 1`,
+  ]);
+  const tracked = JSON.parse(fs.readFileSync(trackedPath, "utf8"));
+  assert.equal(tracked.sb1.paneId, "w1:p3");
+});
+
+test("re-polling never duplicates a pane, even after a restart", async () => {
+  const trackedPath = path.join(tmpDir(), "tracked.json");
+  const sandboxes = () => [{ id: "sb1", name: "agent-one", phase: "Ready", exit_code: null }];
+  await pollOnce({ exec: fakeExec({ sandboxes }), trackedPath });
+  // A fresh exec stands in for a poller restart: state comes off disk, not memory.
+  const exec = fakeExec({ sandboxes });
+  await pollOnce({ exec, trackedPath });
+  await pollOnce({ exec, trackedPath });
+  assert.equal(count(exec.calls, "pane split"), 0, "tracked pane must not be split again");
+  assert.equal(count(exec.calls, "report-agent"), 0, "unchanged state is not re-reported");
+});
+
+test("a vanished sandbox releases its pane once and is forgotten", async () => {
+  const trackedPath = path.join(tmpDir(), "tracked.json");
+  let listed = [{ id: "sb1", name: "agent-one", phase: "Ready", exit_code: null }];
+  const exec = fakeExec({ sandboxes: () => listed });
+  await pollOnce({ exec, trackedPath });
+
+  exec.calls.length = 0;
+  listed = [];
+  await pollOnce({ exec, trackedPath });
+  assert.deepEqual(exec.calls.slice(1), [
+    "herdr pane release-agent w1:p3 --source openshell --agent opencode",
+    "herdr pane close w1:p3",
+  ]);
+  assert.deepEqual(JSON.parse(fs.readFileSync(trackedPath, "utf8")), {});
+
+  exec.calls.length = 0;
+  await pollOnce({ exec, trackedPath });
+  assert.equal(count(exec.calls, "pane close"), 0, "a closed pane must not be closed twice");
+});
+
+test("a Deleting sandbox closes its pane", async () => {
+  const trackedPath = path.join(tmpDir(), "tracked.json");
+  let listed = [{ id: "sb1", name: "agent-one", phase: "Ready", exit_code: null }];
+  const exec = fakeExec({ sandboxes: () => listed });
+  await pollOnce({ exec, trackedPath });
+
+  exec.calls.length = 0;
+  listed = [{ id: "sb1", name: "agent-one", phase: "Deleting", exit_code: null }];
+  await pollOnce({ exec, trackedPath });
+  assert.equal(count(exec.calls, "pane close w1:p3"), 1);
+  assert.deepEqual(JSON.parse(fs.readFileSync(trackedPath, "utf8")), {});
+});
+
+test("stop's transient Error flashes are debounced into paused", async () => {
+  const trackedPath = path.join(tmpDir(), "tracked.json");
+  let sandbox = { id: "sb1", name: "agent-one", phase: "Ready", exit_code: null };
+  const exec = fakeExec({ sandboxes: () => [sandbox] });
+  await pollOnce({ exec, trackedPath });
+
+  exec.calls.length = 0;
+  sandbox = { ...sandbox, phase: "Error", exit_code: 143 };
+  await pollOnce({ exec, trackedPath });
+  assert.equal(count(exec.calls, "report-agent"), 0, "one Error tick is not yet blocked");
+
+  await pollOnce({ exec, trackedPath });
+  assert.deepEqual(exec.calls.filter((call) => call.includes("report-agent")), [
+    `herdr pane report-agent w1:p3 --source openshell --agent opencode --state blocked --seq 2 --message exit code 143`,
+  ]);
+
+  exec.calls.length = 0;
+  sandbox = { ...sandbox, phase: "Stopped" };
+  await pollOnce({ exec, trackedPath });
+  assert.deepEqual(exec.calls.filter((call) => call.includes("report-agent")), [
+    `herdr pane report-agent w1:p3 --source openshell --agent opencode --state idle --seq 3 --message paused: sandbox Stopped`,
+  ]);
+});
+
+test("a sandbox first seen finished gets no pane and no retry", async () => {
+  const trackedPath = path.join(tmpDir(), "tracked.json");
+  const exec = fakeExec({
+    sandboxes: () => [{ id: "sb1", name: "agent-one", phase: "Completed", exit_code: 0 }],
+  });
+  await pollOnce({ exec, trackedPath });
+  assert.equal(count(exec.calls, "pane split") + count(exec.calls, "report-agent"), 0);
+  assert.deepEqual(JSON.parse(fs.readFileSync(trackedPath, "utf8")), {});
+});
+
+test("a failed sandbox list surfaces as a failed tick", async () => {
+  const exec = async () => ({ code: 1, stdout: "", stderr: "connection refused" });
+  await assert.rejects(pollOnce({ exec, trackedPath: path.join(tmpDir(), "t.json") }), {
+    message: /connection refused/,
+  });
 });
