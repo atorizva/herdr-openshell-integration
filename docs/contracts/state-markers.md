@@ -54,7 +54,10 @@ pane to `idle` while the root agent is still working.
 - A missing file, an empty file or a sandbox that cannot be `exec`ed is not an error — markers
   only exist while the agent inside is running; M1 lifecycle mapping still applies.
 - Report with `herdr pane report-agent … --state <idle|working|blocked>`; nothing else is
-  reportable.
+  reportable. A marker has no text, so `blocked` is reported with `--message "needs input"`.
+- Only report a cognitive state while the sandbox is in a running phase
+  (`Provisioning`/`Starting`/`Ready`); once it is terminal its markers are stale and the M1
+  lifecycle mapping stands.
 
 ## Install
 
