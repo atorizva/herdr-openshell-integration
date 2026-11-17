@@ -1,8 +1,8 @@
 id = "herdr-openshell"
 name = "herdr-openshell"
-version = "0.1.0"
+version = "1.0.0"
 min_herdr_version = "0.9.5"
-description = "Mirror OpenShell sandboxes into Herdr panes and report their agent state."
+description = "Report each OpenShell sandbox's agent state in the pane it's connected to."
 platforms = ["linux", "macos"]
 
 # Herdr never reaps plugin children, so the hook must return immediately: the
