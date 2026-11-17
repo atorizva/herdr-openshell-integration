@@ -91,6 +91,34 @@ function mapPhase({ phase, exit_code: exitCode, conditions = [] }) {
   }
 }
 
+// ticket 05: the in-sandbox plugin cannot reach Herdr's socket, so it appends cognitive
+// state markers to a file inside the sandbox and the host reads that file each tick.
+// (docs/contracts/state-markers.md)
+const MARKER_PATH = "/sandbox/.herdr-state";
+const MARKER_RE = /HERDR-STATE state=(idle|working|blocked) seq=([0-9]+)/g;
+// The agent is only alive in these phases; everywhere else its markers are stale.
+const RUNNING_PHASES = new Set(["Provisioning", "Starting", "Ready"]);
+
+// Latest marker newer than `afterSeq`, or null for "no news": a missing file, a failed
+// `exec` and a detached sandbox all fall back to lifecycle-only, never to an error.
+async function readMarker(exec, name, afterSeq) {
+  let read;
+  try {
+    read = await exec("openshell", ["sandbox", "exec", name, "--", "cat", MARKER_PATH]);
+  } catch {
+    return null;
+  }
+  if (read?.code !== 0) return null;
+  let latest = null;
+  for (const [, state, seq] of String(read.stdout ?? "").matchAll(MARKER_RE)) {
+    // Re-attach replays the file, so order by seq, not by position in the read.
+    if (Number(seq) > afterSeq && (!latest || Number(seq) > latest.seq)) {
+      latest = { state, seq: Number(seq) };
+    }
+  }
+  return latest;
+}
+
 const readTracked = (file) => {
   try {
     return JSON.parse(fs.readFileSync(file, "utf8"));
@@ -165,12 +193,32 @@ async function pollOnce({ exec = run, trackedPath = TRACKED_PATH } = {}) {
         state: null,
         message: null,
         errorTicks: 0,
+        // seq of the last marker consumed, and the cognitive state it carried.
+        markerSeq: 0,
+        cognitive: null,
       };
     }
     entry.errorTicks = sandbox.phase === "Error" ? entry.errorTicks + 1 : 0;
-    const target = mapPhase(sandbox);
+    let target = mapPhase(sandbox);
     if (!target) continue;
     if (sandbox.phase === "Error" && entry.errorTicks < ERROR_CONFIRM_TICKS) continue;
+    if (RUNNING_PHASES.has(sandbox.phase)) {
+      const marker = await readMarker(exec, sandbox.name, entry.markerSeq ?? 0);
+      if (marker) {
+        entry.markerSeq = marker.seq;
+        entry.cognitive = marker.state;
+      }
+      // The marker carries no text: a question/permission prompt is just "needs input".
+      if (entry.cognitive) {
+        target =
+          entry.cognitive === "blocked"
+            ? { state: "blocked", message: "needs input" }
+            : { state: entry.cognitive };
+      }
+    } else {
+      // Finished/paused agent: its markers are stale, M1 lifecycle state stands.
+      entry.cognitive = null;
+    }
     const message = target.message ?? null;
     if (entry.state === target.state && entry.message === message) continue;
     const args = [

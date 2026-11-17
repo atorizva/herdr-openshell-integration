@@ -170,7 +170,11 @@ test("maps every sandbox phase onto a Herdr agent state", () => {
 });
 
 // Fake subprocesses: a scripted `openshell`/`herdr`, recording every argv line.
-const fakeExec = ({ sandboxes, panes = [{ pane_id: "w1:p1", focused: true }] }) => {
+const fakeExec = ({
+  sandboxes,
+  markers = () => "",
+  panes = [{ pane_id: "w1:p1", focused: true }],
+}) => {
   const calls = [];
   let splits = 0;
   const ok = (payload) => ({
@@ -183,6 +187,11 @@ const fakeExec = ({ sandboxes, panes = [{ pane_id: "w1:p1", focused: true }] }) 
     calls.push(line);
     if (line === "openshell sandbox list -o json") return ok({ sandboxes: sandboxes() });
     if (line === "herdr pane list") return ok({ result: { panes } });
+    // ticket 05: the marker file read; a string is the file, an object a scripted failure.
+    if (args[0] === "sandbox" && args[1] === "exec") {
+      const result = markers(args[2]);
+      return typeof result === "string" ? ok(result) : result;
+    }
     if (args[0] === "pane" && args[1] === "split") {
       splits += 1;
       return ok({ result: { pane: { pane_id: `w1:p${splits + 2}` } } });
@@ -295,4 +304,124 @@ test("a failed sandbox list surfaces as a failed tick", async () => {
   await assert.rejects(pollOnce({ exec, trackedPath: path.join(tmpDir(), "t.json") }), {
     message: /connection refused/,
   });
+});
+
+// ticket 05: the in-sandbox plugin appends markers; the poller is the reader.
+const marker = (state, seq) => `HERDR-STATE state=${state} seq=${seq}\n`;
+const reports = (calls) => calls.filter((call) => call.includes("report-agent"));
+const READ = "openshell sandbox exec agent-one -- cat /sandbox/.herdr-state";
+
+test("reads the marker file and reports the highest seq, not the last line", async () => {
+  const trackedPath = path.join(tmpDir(), "tracked.json");
+  // Connect replays the file, so lines repeat and need not arrive in seq order.
+  const exec = fakeExec({
+    sandboxes: () => [{ id: "sb1", name: "agent-one", phase: "Ready", exit_code: null }],
+    markers: () => marker("working", 20) + marker("idle", 30) + marker("working", 20),
+  });
+  await pollOnce({ exec, trackedPath });
+  assert.ok(exec.calls.includes(READ), "one marker read per running sandbox per tick");
+  assert.deepEqual(reports(exec.calls), [
+    `herdr pane report-agent w1:p3 --source openshell --agent opencode --state idle --seq 1`,
+  ]);
+});
+
+test("a permission prompt inside the sandbox reports blocked/needs input", async () => {
+  const trackedPath = path.join(tmpDir(), "tracked.json");
+  const exec = fakeExec({
+    sandboxes: () => [{ id: "sb1", name: "agent-one", phase: "Ready", exit_code: null }],
+    markers: () => marker("working", 100) + marker("blocked", 101),
+  });
+  await pollOnce({ exec, trackedPath });
+  assert.deepEqual(reports(exec.calls), [
+    `herdr pane report-agent w1:p3 --source openshell --agent opencode --state blocked --seq 1 --message needs input`,
+  ]);
+  // The consumed seq is persisted so a restarted poller does not replay it.
+  assert.equal(JSON.parse(fs.readFileSync(trackedPath, "utf8")).sb1.markerSeq, 101);
+});
+
+test("each new marker overrides the lifecycle state while the sandbox runs", async () => {
+  const trackedPath = path.join(tmpDir(), "tracked.json");
+  let text = marker("blocked", 10);
+  const exec = fakeExec({
+    sandboxes: () => [{ id: "sb1", name: "agent-one", phase: "Ready", exit_code: null }],
+    markers: () => text,
+  });
+  await pollOnce({ exec, trackedPath });
+
+  text += marker("idle", 11); // permission answered, session went idle
+  await pollOnce({ exec, trackedPath });
+  text += marker("working", 12); // and busy again
+  await pollOnce({ exec, trackedPath });
+
+  assert.deepEqual(reports(exec.calls), [
+    `herdr pane report-agent w1:p3 --source openshell --agent opencode --state blocked --seq 1 --message needs input`,
+    `herdr pane report-agent w1:p3 --source openshell --agent opencode --state idle --seq 2`,
+    `herdr pane report-agent w1:p3 --source openshell --agent opencode --state working --seq 3`,
+  ]);
+});
+
+test("a finished sandbox ignores its stale markers", async () => {
+  const trackedPath = path.join(tmpDir(), "tracked.json");
+  let sandbox = { id: "sb1", name: "agent-one", phase: "Ready", exit_code: null };
+  const exec = fakeExec({
+    sandboxes: () => [sandbox],
+    markers: () => marker("blocked", 5),
+  });
+  await pollOnce({ exec, trackedPath });
+
+  exec.calls.length = 0;
+  sandbox = { ...sandbox, phase: "Completed", exit_code: 0 };
+  await pollOnce({ exec, trackedPath });
+  assert.equal(count(exec.calls, "sandbox exec"), 0, "terminal phases must not read markers");
+  assert.deepEqual(reports(exec.calls), [
+    `herdr pane report-agent w1:p3 --source openshell --agent opencode --state idle --seq 2`,
+  ]);
+});
+
+test("an exec failure or detached sandbox falls back to the lifecycle state", async () => {
+  const trackedPath = path.join(tmpDir(), "tracked.json");
+  const sandboxes = () => [{ id: "sb1", name: "agent-one", phase: "Ready", exit_code: null }];
+  const failing = fakeExec({
+    sandboxes,
+    markers: () => ({ code: 1, stdout: "", stderr: "sandbox is not running" }),
+  });
+  await pollOnce({ exec: failing, trackedPath });
+  assert.deepEqual(reports(failing.calls), [
+    `herdr pane report-agent w1:p3 --source openshell --agent opencode --state working --seq 1`,
+  ]);
+
+  // A rejected exec (no subprocess at all) must not break the tick either.
+  const throwing = fakeExec({
+    sandboxes,
+    markers: () => {
+      throw new Error("spawn openshell ENOENT");
+    },
+  });
+  await pollOnce({ exec: throwing, trackedPath });
+  assert.equal(
+    count(throwing.calls, "report-agent"),
+    0,
+    "unchanged working state is not re-reported",
+  );
+});
+
+test("a replayed lower seq never flips the state backwards", async () => {
+  const trackedPath = path.join(tmpDir(), "tracked.json");
+  let text = marker("idle", 200);
+  const exec = fakeExec({
+    sandboxes: () => [{ id: "sb1", name: "agent-one", phase: "Ready", exit_code: null }],
+    markers: () => text,
+  });
+  await pollOnce({ exec, trackedPath });
+
+  exec.calls.length = 0;
+  text = marker("blocked", 150) + marker("idle", 200); // replay of an already-consumed marker
+  await pollOnce({ exec, trackedPath });
+  assert.deepEqual(reports(exec.calls), [], "seq 150 was already consumed");
+
+  text += marker("blocked", 201); // genuinely new
+  await pollOnce({ exec, trackedPath });
+  assert.deepEqual(reports(exec.calls), [
+    `herdr pane report-agent w1:p3 --source openshell --agent opencode --state blocked --seq 2 --message needs input`,
+  ]);
 });
