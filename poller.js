@@ -20,6 +20,14 @@ const TRACKED_PATH = path.join(STATE_DIR, "tracked.json");
 // Herdr's CLI honours HERDR_SOCKET_PATH from the inherited plugin environment; only the
 // binary is ours to choose.
 const HERDR = process.env.HERDR_BIN_PATH || "herdr";
+const OPEN_SHELL = "openshell";
+// The agent identity every report carries (contract §2, spec decision 8).
+const IDENTITY = ["--source", "openshell", "--agent", "opencode"];
+// The in-sandbox emitter ships next to this file; the poller uploads it into each sandbox
+// (contract §4 - `--upload` cannot be combined with a main-process command, so it is a
+// separate `sandbox upload`).
+const PLUGIN_FILE = path.join(__dirname, "herdr-state-plugin.js");
+const SANDBOX_PLUGIN_DIR = "/sandbox/.config/opencode/plugins/";
 // `sandbox stop` flashes Error/exit 143 before Stopping, so an Error must survive a tick.
 const ERROR_CONFIRM_TICKS = 2;
 
@@ -99,24 +107,63 @@ const MARKER_RE = /HERDR-STATE state=(idle|working|blocked) seq=([0-9]+)/g;
 // The agent is only alive in these phases; everywhere else its markers are stale.
 const RUNNING_PHASES = new Set(["Provisioning", "Starting", "Ready"]);
 
-// Latest marker newer than `afterSeq`, or null for "no news": a missing file, a failed
-// `exec` and a detached sandbox all fall back to lifecycle-only, never to an error.
-async function readMarker(exec, name, afterSeq) {
-  let read;
+// One `cat` of the marker file; null when the file or the sandbox is unreachable. A missing
+// file, a failed `exec` and a detached sandbox are all "no news", never an error.
+async function readMarkerFile(exec, name) {
   try {
-    read = await exec("openshell", ["sandbox", "exec", name, "--", "cat", MARKER_PATH]);
+    const read = await exec(OPEN_SHELL, ["sandbox", "exec", name, "--", "cat", MARKER_PATH]);
+    return read?.code === 0 ? String(read.stdout ?? "") : null;
   } catch {
     return null;
   }
-  if (read?.code !== 0) return null;
+}
+
+const markersIn = (text) => [...String(text ?? "").matchAll(MARKER_RE)];
+
+// Latest marker newer than `afterSeq`, or null for "no news". Re-attach replays the file, so
+// order by seq, not by position in the read.
+function latestMarker(text, afterSeq) {
   let latest = null;
-  for (const [, state, seq] of String(read.stdout ?? "").matchAll(MARKER_RE)) {
-    // Re-attach replays the file, so order by seq, not by position in the read.
+  for (const [, state, seq] of markersIn(text)) {
     if (Number(seq) > afterSeq && (!latest || Number(seq) > latest.seq)) {
       latest = { state, seq: Number(seq) };
     }
   }
   return latest;
+}
+
+// The file is append-only and survives stop -> start, so a freshly seen sandbox already
+// holds the previous run's markers: adopt the highest seq as the baseline, report none.
+const baselineSeq = (text) =>
+  markersIn(text).reduce((max, [, , seq]) => Math.max(max, Number(seq)), 0);
+
+// Deliverable 2: the in-sandbox emitter has to be *inside* the sandbox to emit anything.
+// Best effort - a sandbox that is still provisioning refuses the upload, so the caller
+// retries on a later tick.
+async function uploadPlugin(exec, name) {
+  try {
+    const upload = await exec(OPEN_SHELL, [
+      "sandbox",
+      "upload",
+      name,
+      PLUGIN_FILE,
+      SANDBOX_PLUGIN_DIR,
+    ]);
+    return upload?.code === 0;
+  } catch {
+    return false;
+  }
+}
+
+// A failed report means either "the pane is gone" or "Herdr hiccupped"; only the former may
+// drop tracking. Dropping on a hiccup splits a duplicate pane for the same sandbox next tick.
+async function paneGone(exec, paneId) {
+  try {
+    const got = await exec(HERDR, ["pane", "get", paneId]);
+    return got?.code !== 0 && String(got.stdout ?? "").includes("pane_not_found");
+  } catch {
+    return false;
+  }
 }
 
 const readTracked = (file) => {
@@ -140,7 +187,14 @@ async function openPane(exec, name) {
   const split = await exec(HERDR, ["pane", "split", target, "--direction", "down", "--no-focus"]);
   const paneId = split.code === 0 ? JSON.parse(split.stdout).result?.pane?.pane_id : null;
   if (!paneId) return null;
-  const attached = await exec(HERDR, ["pane", "run", paneId, `openshell sandbox connect ${name}`]);
+  // Spec decision 8: the pane carries its sandbox's name.
+  await exec(HERDR, ["pane", "rename", paneId, name]);
+  const attached = await exec(HERDR, [
+    "pane",
+    "run",
+    paneId,
+    `${OPEN_SHELL} sandbox connect ${name}`,
+  ]);
   if (attached.code === 0) return paneId;
   await exec(HERDR, ["pane", "close", paneId]);
   return null;
@@ -148,22 +202,14 @@ async function openPane(exec, name) {
 
 // Best effort: the pane may already be gone, which is the outcome we want anyway.
 async function closePane(exec, paneId) {
-  await exec(HERDR, [
-    "pane",
-    "release-agent",
-    paneId,
-    "--source",
-    "openshell",
-    "--agent",
-    "opencode",
-  ]);
+  await exec(HERDR, ["pane", "release-agent", paneId, ...IDENTITY]);
   await exec(HERDR, ["pane", "close", paneId]);
 }
 
 // ticket 03: `openshell sandbox list -o json` -> diff against tracked sandboxes ->
 // pane split/run per new sandbox, close per vanished one, report_agent per state change.
 async function pollOnce({ exec = run, trackedPath = TRACKED_PATH } = {}) {
-  const listed = await exec("openshell", ["sandbox", "list", "-o", "json"]);
+  const listed = await exec(OPEN_SHELL, ["sandbox", "list", "-o", "json"]);
   if (listed.code !== 0) {
     throw new Error(`openshell sandbox list failed: ${listed.stderr.trim() || listed.code}`);
   }
@@ -181,6 +227,9 @@ async function pollOnce({ exec = run, trackedPath = TRACKED_PATH } = {}) {
 
   for (const sandbox of sandboxes) {
     let entry = tracked[sandbox.id];
+    // A sandbox this poller has never tracked: its marker file may still hold the previous
+    // run's state, so this tick adopts it as a baseline and reports no marker.
+    const firstSight = !entry;
     if (!entry) {
       // `connect` fails immediately on a finished main process - never open a pane for one.
       if (["Completed", "Error", "Deleting"].includes(sandbox.phase)) continue;
@@ -196,17 +245,27 @@ async function pollOnce({ exec = run, trackedPath = TRACKED_PATH } = {}) {
         // seq of the last marker consumed, and the cognitive state it carried.
         markerSeq: 0,
         cognitive: null,
+        // plugin upload acknowledged by the sandbox.
+        installed: false,
       };
+    }
+    if (!entry.installed && RUNNING_PHASES.has(sandbox.phase)) {
+      entry.installed = await uploadPlugin(exec, sandbox.name);
     }
     entry.errorTicks = sandbox.phase === "Error" ? entry.errorTicks + 1 : 0;
     let target = mapPhase(sandbox);
     if (!target) continue;
     if (sandbox.phase === "Error" && entry.errorTicks < ERROR_CONFIRM_TICKS) continue;
     if (RUNNING_PHASES.has(sandbox.phase)) {
-      const marker = await readMarker(exec, sandbox.name, entry.markerSeq ?? 0);
-      if (marker) {
-        entry.markerSeq = marker.seq;
-        entry.cognitive = marker.state;
+      const file = await readMarkerFile(exec, sandbox.name);
+      if (firstSight) {
+        entry.markerSeq = baselineSeq(file);
+      } else {
+        const marker = latestMarker(file, entry.markerSeq ?? 0);
+        if (marker) {
+          entry.markerSeq = marker.seq;
+          entry.cognitive = marker.state;
+        }
       }
       // The marker carries no text: a question/permission prompt is just "needs input".
       if (entry.cognitive) {
@@ -221,28 +280,28 @@ async function pollOnce({ exec = run, trackedPath = TRACKED_PATH } = {}) {
     }
     const message = target.message ?? null;
     if (entry.state === target.state && entry.message === message) continue;
+    entry.seq += 1;
     const args = [
       "pane",
       "report-agent",
       entry.paneId,
-      "--source",
-      "openshell",
-      "--agent",
-      "opencode",
+      ...IDENTITY,
       "--state",
       target.state,
       "--seq",
-      String((entry.seq += 1)),
+      String(entry.seq),
     ];
     if (message) args.push("--message", message);
     const reported = await exec(HERDR, args);
     if (reported.code === 0) {
       entry.state = target.state;
       entry.message = message;
-    } else {
+    } else if (await paneGone(exec, entry.paneId)) {
       // Pane closed under us: forget it, a still-live sandbox gets a fresh pane next tick.
       delete tracked[sandbox.id];
     }
+    // Otherwise Herdr hiccupped: keep the entry so the next tick retries this report rather
+    // than splitting a second pane for the same sandbox.
   }
 
   writeTracked(trackedPath, tracked);

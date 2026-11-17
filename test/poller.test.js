@@ -144,6 +144,11 @@ test("maps every sandbox phase onto a Herdr agent state", () => {
     assert.deepEqual(mapPhase({ ...ready, phase }), { state: "working" }, phase);
   }
   assert.deepEqual(mapPhase({ phase: "Completed", exit_code: 0 }), { state: "idle" });
+  // A main process that finished non-zero is a failure, not a quiet completion.
+  assert.deepEqual(mapPhase({ phase: "Completed", exit_code: 9 }), {
+    state: "blocked",
+    message: "exit code 9",
+  });
   assert.deepEqual(mapPhase({ phase: "Error", exit_code: 7, conditions: [] }), {
     state: "blocked",
     message: "exit code 7",
@@ -170,10 +175,25 @@ test("maps every sandbox phase onto a Herdr agent state", () => {
 });
 
 // Fake subprocesses: a scripted `openshell`/`herdr`, recording every argv line.
+const PANE_HICCUP = {
+  code: 1,
+  stdout: '{"error":{"code":"api_failed"}}',
+  stderr: "socket closed",
+};
+const PANE_NOT_FOUND = {
+  code: 1,
+  stdout: '{"error":{"code":"pane_not_found","message":"pane w1:p3 not found"}}',
+  stderr: "",
+};
 const fakeExec = ({
   sandboxes,
   markers = () => "",
   panes = [{ pane_id: "w1:p1", focused: true }],
+  // false scripts a failed report-agent: a Herdr socket hiccup, not a missing pane.
+  report = () => true,
+  // the answer to `herdr pane get`: existence, scripted separately from the report.
+  paneGet = () => ({ code: 0, stdout: '{"result":{"pane":{"pane_id":"w1:p3"}}}', stderr: "" }),
+  upload = () => true,
 }) => {
   const calls = [];
   let splits = 0;
@@ -192,16 +212,41 @@ const fakeExec = ({
       const result = markers(args[2]);
       return typeof result === "string" ? ok(result) : result;
     }
+    if (args[0] === "sandbox" && args[1] === "upload") {
+      return upload(args[2]) ? ok() : { code: 1, stdout: "", stderr: "sandbox not ready" };
+    }
+    if (args[0] === "pane" && args[1] === "get") return paneGet(args[2]);
     if (args[0] === "pane" && args[1] === "split") {
       splits += 1;
       return ok({ result: { pane: { pane_id: `w1:p${splits + 2}` } } });
     }
+    if (args[0] === "pane" && args[1] === "report-agent") return report() ? ok() : PANE_HICCUP;
     return ok();
   };
   exec.calls = calls;
   return exec;
 };
 const count = (calls, needle) => calls.filter((call) => call.includes(needle)).length;
+
+// A sandbox this poller has already seen: tracked.json is what a restarted poller reads, and
+// only a first sight baselines the marker file, so the marker tests start from here.
+const seedTracked = (trackedPath) =>
+  fs.writeFileSync(
+    trackedPath,
+    JSON.stringify({
+      sb1: {
+        name: "agent-one",
+        paneId: "w1:p3",
+        seq: 0,
+        state: null,
+        message: null,
+        errorTicks: 0,
+        markerSeq: 0,
+        cognitive: null,
+        installed: true,
+      },
+    }),
+  );
 
 test("a new sandbox becomes one pane running connect, reported as working", async () => {
   const trackedPath = path.join(tmpDir(), "tracked.json");
@@ -212,12 +257,74 @@ test("a new sandbox becomes one pane running connect, reported as working", asyn
 
   assert.equal(count(exec.calls, "pane split"), 1, "one split per sandbox");
   assert.ok(exec.calls.includes("herdr pane run w1:p3 openshell sandbox connect agent-one"));
+  assert.ok(exec.calls.includes("herdr pane rename w1:p3 agent-one"), "pane is named after it");
   const reports = exec.calls.filter((call) => call.includes("report-agent"));
   assert.deepEqual(reports, [
     `herdr pane report-agent w1:p3 --source openshell --agent opencode --state working --seq 1`,
   ]);
   const tracked = JSON.parse(fs.readFileSync(trackedPath, "utf8"));
   assert.equal(tracked.sb1.paneId, "w1:p3");
+});
+
+// Deliverable 2: the in-sandbox emitter is uploaded, best effort, and never re-uploaded.
+test("the state plugin is uploaded once per sandbox, retried until it lands", async () => {
+  const trackedPath = path.join(tmpDir(), "tracked.json");
+  const sandboxes = () => [{ id: "sb1", name: "agent-one", phase: "Ready", exit_code: null }];
+  let attempts = 0;
+  const exec = fakeExec({ sandboxes, upload: () => ++attempts > 1 });
+
+  await pollOnce({ exec, trackedPath });
+  assert.equal(attempts, 1);
+  assert.equal(count(exec.calls, "pane split"), 1, "a failed upload must not cost the pane");
+  const plugin = path.join(REPO, "herdr-state-plugin.js");
+  assert.ok(
+    exec.calls.includes(
+      `openshell sandbox upload agent-one ${plugin} /sandbox/.config/opencode/plugins/`,
+    ),
+    "the emitter is uploaded next to the other opencode plugins",
+  );
+
+  await pollOnce({ exec, trackedPath }); // not acknowledged yet: retried
+  assert.equal(attempts, 2);
+
+  exec.calls.length = 0;
+  await pollOnce({ exec, trackedPath }); // acknowledged: silent
+  assert.equal(count(exec.calls, "sandbox upload"), 0);
+  assert.equal(attempts, 2);
+});
+
+// Bug: a transient report failure used to drop tracking, so the next tick split a second
+// pane for the same sandbox.
+test("a failed report-agent keeps the pane instead of splitting a duplicate", async () => {
+  const trackedPath = path.join(tmpDir(), "tracked.json");
+  const sandboxes = () => [{ id: "sb1", name: "agent-one", phase: "Ready", exit_code: null }];
+  const exec = fakeExec({ sandboxes, report: () => false });
+  await pollOnce({ exec, trackedPath });
+
+  assert.equal(
+    JSON.parse(fs.readFileSync(trackedPath, "utf8")).sb1.paneId,
+    "w1:p3",
+    "a hiccup is not a gone pane",
+  );
+
+  exec.calls.length = 0;
+  await pollOnce({ exec, trackedPath });
+  assert.equal(count(exec.calls, "pane split"), 0, "the pane must not be duplicated");
+  assert.deepEqual(reports(exec.calls), [
+    `herdr pane report-agent w1:p3 --source openshell --agent opencode --state working --seq 2`,
+  ]);
+});
+
+test("a report on a genuinely vanished pane drops tracking and re-splits", async () => {
+  const trackedPath = path.join(tmpDir(), "tracked.json");
+  const sandboxes = () => [{ id: "sb1", name: "agent-one", phase: "Ready", exit_code: null }];
+  const exec = fakeExec({ sandboxes, report: () => false, paneGet: () => PANE_NOT_FOUND });
+  await pollOnce({ exec, trackedPath });
+  assert.deepEqual(JSON.parse(fs.readFileSync(trackedPath, "utf8")), {});
+
+  exec.calls.length = 0;
+  await pollOnce({ exec, trackedPath });
+  assert.equal(count(exec.calls, "pane split"), 1, "a still-live sandbox gets a fresh pane");
 });
 
 test("re-polling never duplicates a pane, even after a restart", async () => {
@@ -313,6 +420,7 @@ const READ = "openshell sandbox exec agent-one -- cat /sandbox/.herdr-state";
 
 test("reads the marker file and reports the highest seq, not the last line", async () => {
   const trackedPath = path.join(tmpDir(), "tracked.json");
+  seedTracked(trackedPath);
   // Connect replays the file, so lines repeat and need not arrive in seq order.
   const exec = fakeExec({
     sandboxes: () => [{ id: "sb1", name: "agent-one", phase: "Ready", exit_code: null }],
@@ -327,6 +435,7 @@ test("reads the marker file and reports the highest seq, not the last line", asy
 
 test("a permission prompt inside the sandbox reports blocked/needs input", async () => {
   const trackedPath = path.join(tmpDir(), "tracked.json");
+  seedTracked(trackedPath);
   const exec = fakeExec({
     sandboxes: () => [{ id: "sb1", name: "agent-one", phase: "Ready", exit_code: null }],
     markers: () => marker("working", 100) + marker("blocked", 101),
@@ -341,6 +450,7 @@ test("a permission prompt inside the sandbox reports blocked/needs input", async
 
 test("each new marker overrides the lifecycle state while the sandbox runs", async () => {
   const trackedPath = path.join(tmpDir(), "tracked.json");
+  seedTracked(trackedPath);
   let text = marker("blocked", 10);
   const exec = fakeExec({
     sandboxes: () => [{ id: "sb1", name: "agent-one", phase: "Ready", exit_code: null }],
@@ -420,6 +530,33 @@ test("a replayed lower seq never flips the state backwards", async () => {
   assert.deepEqual(reports(exec.calls), [], "seq 150 was already consumed");
 
   text += marker("blocked", 201); // genuinely new
+  await pollOnce({ exec, trackedPath });
+  assert.deepEqual(reports(exec.calls), [
+    `herdr pane report-agent w1:p3 --source openshell --agent opencode --state blocked --seq 2 --message needs input`,
+  ]);
+});
+
+// Bug: the marker file survives stop -> start, so a first sight used to adopt the previous
+// run's last marker (an old `blocked` surfaced as "needs input" on a fresh agent).
+test("a first sight of a sandbox baselines the old markers instead of replaying them", async () => {
+  const trackedPath = path.join(tmpDir(), "tracked.json");
+  let text = marker("blocked", 42); // left over from the previous run of this sandbox
+  const exec = fakeExec({
+    sandboxes: () => [{ id: "sb1", name: "agent-one", phase: "Ready", exit_code: null }],
+    markers: () => text,
+  });
+  await pollOnce({ exec, trackedPath });
+  assert.deepEqual(reports(exec.calls), [
+    `herdr pane report-agent w1:p3 --source openshell --agent opencode --state working --seq 1`,
+  ]);
+  assert.equal(
+    JSON.parse(fs.readFileSync(trackedPath, "utf8")).sb1.markerSeq,
+    42,
+    "the old marker becomes the baseline, silently",
+  );
+
+  exec.calls.length = 0;
+  text += marker("blocked", 43); // the new run asking a question is real news
   await pollOnce({ exec, trackedPath });
   assert.deepEqual(reports(exec.calls), [
     `herdr pane report-agent w1:p3 --source openshell --agent opencode --state blocked --seq 2 --message needs input`,

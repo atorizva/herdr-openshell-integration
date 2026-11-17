@@ -48,14 +48,14 @@ export const STATE_BY_EVENT = new Map([
   ["session.idle", "idle"],
 ]);
 
-// Subagent events must not overwrite the pane state of the root session, except
-// for the ones that genuinely mean "the human is being asked".
-const CHILD_EVENT_STATES = new Map([
-  ["permission.asked", "blocked"],
-  ["question.asked", "blocked"],
-  ["permission.replied", "working"],
-  ["question.replied", "working"],
-  ["question.rejected", "working"],
+// Subagent events must not overwrite the pane state of the root session, except for the
+// ones that genuinely mean "the human is being asked" (and their answers).
+const CHILD_EVENTS = new Set([
+  "permission.asked",
+  "question.asked",
+  "permission.replied",
+  "question.replied",
+  "question.rejected",
 ]);
 
 export function stateForEvent(type, properties = {}) {
@@ -88,9 +88,11 @@ export function createStateEmitter(write) {
     const info = properties.info;
     if (info?.id && info.parentID) childSessions.add(info.id);
 
+    // A subagent may only report the events that mean "a human is being asked"; every other
+    // one would overwrite the root session's state.
     const state =
-      sessionID && childSessions.has(sessionID)
-        ? CHILD_EVENT_STATES.get(type)
+      sessionID && childSessions.has(sessionID) && !CHILD_EVENTS.has(type)
+        ? undefined
         : stateForEvent(type, properties);
 
     if (!state || state === lastState) return;
