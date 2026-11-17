@@ -1,0 +1,12 @@
+id = "herdr-openshell"
+name = "herdr-openshell"
+version = "0.1.0"
+min_herdr_version = "0.9.5"
+description = "Mirror OpenShell sandboxes into Herdr panes and report their agent state."
+platforms = ["linux", "macos"]
+
+# Herdr never reaps plugin children, so the hook must return immediately: the
+# poller re-spawns itself detached and exits. `node` comes from PATH (cwd is the
+# plugin root).
+[[startup]]
+command = ["node", "poller.js", "--detach"]
