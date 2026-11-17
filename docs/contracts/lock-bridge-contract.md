@@ -6,7 +6,8 @@ attach transcripts: `/tmp/opencode/herdr-research/` (outside the repo).
 
 ## 1. Sandbox → pane identity
 
-One sandbox = one opencode agent = one Herdr pane.
+One sandbox = one opencode agent, surfaced in the one Herdr pane the user connected to it from
+(the plugin never creates a pane).
 
 | Need | Field path | Notes |
 |---|---|---|
@@ -41,7 +42,7 @@ This also happens for ~1 s right after `create` — treat it as "recheck next ti
 | `Error` (`exit_code != 0`) | `--state blocked --message "exit code <n>"` | blocked |
 | `Error` (infra, `exit_code` null) | `--state blocked --message "<conditions[].reason>"` | blocked |
 | `Stopped`, `Suspending`, `Suspended` | `--state idle --message "paused: sandbox <phase>"` | done (paused) |
-| `Deleting`, or absent from `list` | `release-agent`, close pane | — |
+| `Deleting`, or absent from `list` | `release-agent` (never close the pane) | — |
 | `Unspecified`, `Unknown` | `--state unknown` | unknown |
 
 Rules:
@@ -56,16 +57,25 @@ Rules:
 - Send `--seq` strictly increasing per pane; on pane removal, `herdr pane release-agent`.
 - A non-zero `report-agent` exit is **not** proof the pane is gone: confirm with
   `herdr pane get <pane_id>` (`error.code == "pane_not_found"`) and only then drop tracking.
-  Any other failure is transient — retry the same report next tick rather than splitting a
-  second pane for the same sandbox.
-- Never re-spawn `connect` for a `Completed`/`Error` sandbox — its main process is gone and
-  `connect` fails immediately.
+  Any other failure is transient — retry the same report next tick rather than re-detecting
+  (and reporting twice) for the same sandbox.
+- A `Completed`/`Error` sandbox has a gone main process, so it can never be connected to —
+  it never gets a row.
 
-## 3. Pane command
+## 3. Pane detection
 
-`herdr pane split` + `herdr pane rename "<id>" "<sandbox name>"` +
-`herdr pane run "<id>" "openshell sandbox connect <name>"` (spec decision 8: the pane is
-named after its sandbox; `pane rename` is the CLI's label setter, `PaneInfo.label`).
+The poller never creates a pane. It maps each sandbox to the pane the user connected to it
+from, via `herdr pane process-info --pane <id>` → `foreground_processes[].argv`. A live
+`connect` session shows three foreground processes; the sandbox name is recoverable from any
+of them:
+
+- `openshell sandbox connect <name>` (argv `["openshell","sandbox","connect",<name>]`);
+- the `ssh` child's `ProxyCommand=… openshell ssh-proxy … --sandbox <name> …` string;
+- the `/usr/bin/openshell ssh-proxy … --sandbox <name> …` process (the `--sandbox` token).
+
+The older `openshell sandbox exec -n <name> --tty …` session shows a single `openshell
+sandbox exec` argv instead (no ssh child). **The ssh/ssh-proxy argv carries a `--token`
+credential — never log or store raw argv.**
 
 `connect` attaches to the sandbox's **canonical main process** (`ssh -tt … -s sandbox
 openshell-main`), not to a new shell:

@@ -51,3 +51,12 @@ The decision body above was corrected to match tickets 04/05 and the final revie
   consequence "only flows while a Herdr pane is attached".
 - Plugin installation is automated by the poller, not a manual per-sandbox step.
 
+## Amendment 2 (pane detection, 2026-11-17)
+
+The poller no longer creates a pane. It **detects** the pane the user connected each sandbox
+to (via `herdr pane process-info` — the connect session's `ssh`/`ssh-proxy` argv carries the
+sandbox name) and reports state to that pane. A sandbox the user has not connected to has no
+pane and therefore no row. This replaces the original "mirrors each sandbox into a Herdr
+pane" model: the plugin must not open an extra pane per sandbox. On removal it releases the
+agent row (`herdr pane release-agent`) and never closes the user's pane.
+

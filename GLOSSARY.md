@@ -35,5 +35,5 @@ The `HERDR-STATE state=… seq=…` line the in-sandbox opencode plugin writes t
 _Avoid_: signal, event line.
 
 **Bridge**:
-The Herdr plugin (and its detached poller) that mirrors each OpenShell sandbox into a Herdr
-pane and reports the pane's agent state.
+The Herdr plugin (and its detached poller) that detects the pane the user connected each
+OpenShell sandbox to, and reports that pane's agent state.

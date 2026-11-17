@@ -15,7 +15,8 @@ const STATE_DIR =
   process.env.HERDR_PLUGIN_STATE_DIR || path.join(os.tmpdir(), "herdr-openshell");
 const LOCK_PATH = path.join(STATE_DIR, "poller.lock");
 const BEAT_PATH = path.join(STATE_DIR, "poller.json");
-// sandbox id -> {paneId, ...}: persisted so a restarted poller never re-splits a pane.
+// sandbox id -> {paneId, ...}: the pane we detected (never one we created), persisted so a
+// restarted poller keeps reporting to the same pane.
 const TRACKED_PATH = path.join(STATE_DIR, "tracked.json");
 // Herdr's CLI honours HERDR_SOCKET_PATH from the inherited plugin environment; only the
 // binary is ours to choose.
@@ -176,38 +177,62 @@ const readTracked = (file) => {
 const writeTracked = (file, tracked) =>
   fs.writeFileSync(file, JSON.stringify(tracked, null, 2));
 
-// Split off the focused pane (or any pane, on a headless/unfocused server) and attach
-// the sandbox's canonical main process in it.
-async function openPane(exec, name) {
-  const listed = await exec(HERDR, ["pane", "list"]);
-  if (listed.code !== 0) return null;
-  const panes = JSON.parse(listed.stdout).result?.panes ?? [];
-  const target = (panes.find((pane) => pane.focused) ?? panes[0])?.pane_id;
-  if (!target) return null;
-  const split = await exec(HERDR, ["pane", "split", target, "--direction", "down", "--no-focus"]);
-  const paneId = split.code === 0 ? JSON.parse(split.stdout).result?.pane?.pane_id : null;
-  if (!paneId) return null;
-  // Spec decision 8: the pane carries its sandbox's name.
-  await exec(HERDR, ["pane", "rename", paneId, name]);
-  const attached = await exec(HERDR, [
-    "pane",
-    "run",
-    paneId,
-    `${OPEN_SHELL} sandbox connect ${name}`,
-  ]);
-  if (attached.code === 0) return paneId;
-  await exec(HERDR, ["pane", "close", paneId]);
+// The connect/exec session's foreground argv is the only thing that links a pane to a
+// sandbox. `openshell sandbox connect <name>` becomes an `ssh` to the sandbox's canonical
+// main process whose ProxyCommand is `openshell ssh-proxy … --sandbox <name> …`; the older
+// `sandbox exec -n <name> --tty …` shows the exec argv directly. Recover the name from either.
+// (Never log/store the argv - the ssh ProxyCommand carries a --token credential.)
+function sandboxNameOf(proc) {
+  const argv = proc.argv ?? [];
+  if (argv[0] === OPEN_SHELL && argv[1] === "sandbox") {
+    if (argv[2] === "connect") return argv[3] ?? null;
+    if (argv[2] === "exec") {
+      const nameIndex = argv.indexOf("-n");
+      if (nameIndex >= 0) return argv[nameIndex + 1] ?? null;
+      const nameFlag = argv.indexOf("--name");
+      if (nameFlag >= 0) return argv[nameFlag + 1] ?? null;
+      return argv[3] && !argv[3].startsWith("-") ? argv[3] : null;
+    }
+  }
+  const sandboxFlag = argv.indexOf("--sandbox");
+  if (sandboxFlag >= 0) return argv[sandboxFlag + 1] ?? null;
+  const proxy = argv.find((arg) => typeof arg === "string" && arg.includes("ssh-proxy"));
+  if (proxy) {
+    const match = proxy.match(/--sandbox\s+(\S+)/);
+    if (match) return match[1];
+  }
   return null;
 }
 
-// Best effort: the pane may already be gone, which is the outcome we want anyway.
-async function closePane(exec, paneId) {
+// Map sandbox name -> pane id from the panes whose foreground process is a live connect or
+// exec session. One scan per tick serves every sandbox; a pane not yet connected simply
+// contributes nothing, so the sandbox gets no row until the user connects.
+async function detectPanes(exec) {
+  const listed = await exec(HERDR, ["pane", "list"]);
+  if (listed.code !== 0) return new Map();
+  const panes = JSON.parse(listed.stdout).result?.panes ?? [];
+  const byName = new Map();
+  for (const pane of panes) {
+    const info = await exec(HERDR, ["pane", "process-info", "--pane", pane.pane_id]);
+    if (info.code !== 0) continue;
+    const procs = JSON.parse(info.stdout).result?.process_info?.foreground_processes ?? [];
+    for (const proc of procs) {
+      const name = sandboxNameOf(proc);
+      if (name && !byName.has(name)) byName.set(name, pane.pane_id);
+    }
+  }
+  return byName;
+}
+
+// The pane is the user's own (we never split one), so releasing the agent row is all we ever
+// do - closing it would destroy the user's terminal.
+async function releasePane(exec, paneId) {
   await exec(HERDR, ["pane", "release-agent", paneId, ...IDENTITY]);
-  await exec(HERDR, ["pane", "close", paneId]);
 }
 
 // ticket 03: `openshell sandbox list -o json` -> diff against tracked sandboxes ->
-// pane split/run per new sandbox, close per vanished one, report_agent per state change.
+// detect the pane the user connected to per sandbox, release per vanished one, report_agent
+// per state change.
 async function pollOnce({ exec = run, trackedPath = TRACKED_PATH } = {}) {
   const listed = await exec(OPEN_SHELL, ["sandbox", "list", "-o", "json"]);
   if (listed.code !== 0) {
@@ -216,12 +241,13 @@ async function pollOnce({ exec = run, trackedPath = TRACKED_PATH } = {}) {
   const sandboxes = JSON.parse(listed.stdout).sandboxes ?? [];
   const tracked = readTracked(trackedPath);
   const live = new Map(sandboxes.map((sandbox) => [sandbox.id, sandbox]));
+  const connectPanes = await detectPanes(exec);
 
   for (const [id, entry] of Object.entries(tracked)) {
     const sandbox = live.get(id);
     if (sandbox && sandbox.phase !== "Deleting") continue;
     // Deleting, or gone from `list` entirely: the sandbox is being removed.
-    await closePane(exec, entry.paneId);
+    await releasePane(exec, entry.paneId);
     delete tracked[id];
   }
 
@@ -231,10 +257,11 @@ async function pollOnce({ exec = run, trackedPath = TRACKED_PATH } = {}) {
     // run's state, so this tick adopts it as a baseline and reports no marker.
     const firstSight = !entry;
     if (!entry) {
-      // `connect` fails immediately on a finished main process - never open a pane for one.
+      // `connect` fails immediately on a finished main process, so a finished sandbox can
+      // never be connected to. Only a running sandbox the user has connected to gets a row.
       if (["Completed", "Error", "Deleting"].includes(sandbox.phase)) continue;
-      const paneId = await openPane(exec, sandbox.name);
-      if (!paneId) continue;
+      const paneId = connectPanes.get(sandbox.name);
+      if (!paneId) continue; // running but not yet connected: no pane to report to
       entry = tracked[sandbox.id] = {
         name: sandbox.name,
         paneId,
@@ -248,6 +275,12 @@ async function pollOnce({ exec = run, trackedPath = TRACKED_PATH } = {}) {
         // plugin upload acknowledged by the sandbox.
         installed: false,
       };
+    } else if (connectPanes.get(sandbox.name) && connectPanes.get(sandbox.name) !== entry.paneId) {
+      // The user reconnected in a different pane: move the row there.
+      await releasePane(exec, entry.paneId);
+      entry.paneId = connectPanes.get(sandbox.name);
+      entry.state = null; // force a fresh report on the new pane
+      entry.message = null;
     }
     if (!entry.installed && RUNNING_PHASES.has(sandbox.phase)) {
       entry.installed = await uploadPlugin(exec, sandbox.name);
@@ -297,11 +330,11 @@ async function pollOnce({ exec = run, trackedPath = TRACKED_PATH } = {}) {
       entry.state = target.state;
       entry.message = message;
     } else if (await paneGone(exec, entry.paneId)) {
-      // Pane closed under us: forget it, a still-live sandbox gets a fresh pane next tick.
+      // Pane closed under us: forget it, a still-live sandbox is re-detected next tick.
       delete tracked[sandbox.id];
     }
     // Otherwise Herdr hiccupped: keep the entry so the next tick retries this report rather
-    // than splitting a second pane for the same sandbox.
+    // than re-detecting (and possibly reporting twice) for the same sandbox.
   }
 
   writeTracked(trackedPath, tracked);
@@ -344,7 +377,7 @@ async function main() {
   tick();
 }
 
-module.exports = { mapPhase, pollOnce };
+module.exports = { mapPhase, pollOnce, sandboxNameOf };
 
 if (require.main === module) {
   fs.mkdirSync(STATE_DIR, { recursive: true });
