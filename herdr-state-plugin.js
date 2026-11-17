@@ -18,9 +18,14 @@
 //   * always appended to `$HOME/.herdr-state` (`/sandbox/.herdr-state`), which
 //     the host reads with `openshell sandbox exec <name> -- cat /sandbox/.herdr-state`;
 //   * also written to stdout when stdout is the agent's terminal. In opencode
-//     v2.3.0 plugins load in the `opencode serve --stdio` child, whose stdout is
+//     v2.x plugins load in the `opencode serve --stdio` child, whose stdout is
 //     a pipe/socket (or /dev/null), not the pane — writing markers there would
 //     corrupt the server protocol instead of reaching the pane.
+//
+// opencode v2 plugin API: only `setup(ctx)` is honoured; the V1 `server()`/`event`
+// hook does NOT run in v2 (the original bug). Events arrive from
+// `ctx.event.subscribe({ signal })` as `{ type, data, ... }` — payload in `data`,
+// not V1's `properties`.
 
 import fs from "node:fs";
 import path from "node:path";
@@ -28,44 +33,39 @@ import path from "node:path";
 const MARKER_PREFIX = "HERDR-STATE";
 const MARKER_FILE = path.join(process.env.HOME ?? "/sandbox", ".herdr-state");
 
-export const STATE_BY_STATUS = new Map([
-  ["idle", "idle"],
-  ["active", "working"],
-  ["busy", "working"],
-  ["running", "working"],
-]);
-
+// opencode v2 event -> Herdr agent state. `session.status`/`session.idle` are declared
+// in the v2 schema but have no publisher, so the real signals are `session.execution.*`
+// (busy/idle) and `permission.*`/`form.*` (needs input; v2 has no `question.*` events).
 export const STATE_BY_EVENT = new Map([
-  ["permission.asked", "blocked"],
-  ["question.asked", "blocked"],
-  ["session.error", "blocked"],
-  ["tool.execute.before", "working"],
-  ["tool.execute.after", "working"],
+  // working: a turn began or continued, or the human answered a prompt
+  ["session.execution.started", "working"],
+  ["session.step.started", "working"],
+  ["session.step.ended", "working"],
+  ["session.tool.called", "working"],
+  ["session.retry.scheduled", "working"],
   ["permission.replied", "working"],
-  ["question.replied", "working"],
-  ["question.rejected", "working"],
-  ["session.compacted", "working"],
-  ["session.idle", "idle"],
+  ["form.replied", "working"],
+  ["form.cancelled", "working"],
+  // idle: the turn finished
+  ["session.execution.succeeded", "idle"],
+  ["session.execution.interrupted", "idle"],
+  // blocked: needs the human (pending permission, a question form, or a failed turn)
+  ["permission.asked", "blocked"],
+  ["form.created", "blocked"],
+  ["session.execution.failed", "blocked"],
 ]);
 
-// Subagent events must not overwrite the pane state of the root session, except for the
-// ones that genuinely mean "the human is being asked" (and their answers).
+// Subagent (child) events must not overwrite the root session's state, except the ones
+// that genuinely mean "the human is being asked" (and their answers).
 const CHILD_EVENTS = new Set([
   "permission.asked",
-  "question.asked",
+  "form.created",
   "permission.replied",
-  "question.replied",
-  "question.rejected",
+  "form.replied",
+  "form.cancelled",
 ]);
 
-export function stateForEvent(type, properties = {}) {
-  if (type === "session.status") {
-    const status = properties.status;
-    const kind = typeof status === "string" ? status : status?.type;
-    return typeof kind === "string"
-      ? STATE_BY_STATUS.get(kind.toLowerCase())
-      : undefined;
-  }
+export function stateForEvent(type) {
   return STATE_BY_EVENT.get(type);
 }
 
@@ -81,19 +81,18 @@ export function createStateEmitter(write) {
 
   return (event) => {
     const type = event?.type;
-    const properties = event?.properties ?? {};
-    const sessionID =
-      typeof properties.sessionID === "string" ? properties.sessionID : undefined;
+    const data = event?.data ?? {};
+    const sessionID = typeof data.sessionID === "string" ? data.sessionID : undefined;
 
-    const info = properties.info;
-    if (info?.id && info.parentID) childSessions.add(info.id);
+    // v2 marks a subagent child on session.created with a parentID.
+    if (type === "session.created" && data.parentID) childSessions.add(data.sessionID);
 
     // A subagent may only report the events that mean "a human is being asked"; every other
     // one would overwrite the root session's state.
     const state =
       sessionID && childSessions.has(sessionID) && !CHILD_EVENTS.has(type)
         ? undefined
-        : stateForEvent(type, properties);
+        : stateForEvent(type);
 
     if (!state || state === lastState) return;
     lastState = state;
@@ -116,15 +115,20 @@ function writeMarker(line) {
   }
 }
 
-export const HerdrStatePlugin = async () => {
-  const emit = createStateEmitter(writeMarker);
-  return {
-    event: async ({ event }) => emit(event),
-  };
-};
-
 export default {
   id: "herdr.openshell-state",
-  server: HerdrStatePlugin,
-  setup() {},
+  setup(ctx) {
+    const emit = createStateEmitter(writeMarker);
+    const controller = new AbortController();
+    void (async () => {
+      try {
+        for await (const event of ctx.event.subscribe({ signal: controller.signal })) {
+          emit(event);
+        }
+      } catch {
+        // subscription aborted on dispose; nothing to do
+      }
+    })();
+    return () => controller.abort();
+  },
 };

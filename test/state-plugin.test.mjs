@@ -22,32 +22,41 @@ const statesFor = (events) => {
 };
 
 test("M2 event map: blocked", () => {
-  for (const type of ["permission.asked", "question.asked", "session.error"]) {
-    assert.equal(stateForEvent(type, {}), "blocked", type);
+  for (const type of ["permission.asked", "form.created", "session.execution.failed"]) {
+    assert.equal(stateForEvent(type), "blocked", type);
   }
 });
 
 test("M2 event map: working", () => {
-  for (const type of ["tool.execute.before", "tool.execute.after"]) {
-    assert.equal(stateForEvent(type, {}), "working", type);
-  }
-  for (const status of ["active", "busy", "running"]) {
-    assert.equal(stateForEvent("session.status", { status }), "working", status);
-    assert.equal(stateForEvent("session.status", { status: { type: status } }), "working", status);
+  for (const type of [
+    "session.execution.started",
+    "session.step.started",
+    "session.step.ended",
+    "session.tool.called",
+    "session.retry.scheduled",
+    "permission.replied",
+    "form.replied",
+    "form.cancelled",
+  ]) {
+    assert.equal(stateForEvent(type), "working", type);
   }
 });
 
 test("M2 event map: idle", () => {
-  assert.equal(stateForEvent("session.idle", {}), "idle");
-  assert.equal(stateForEvent("session.status", { status: "idle" }), "idle");
+  for (const type of ["session.execution.succeeded", "session.execution.interrupted"]) {
+    assert.equal(stateForEvent(type), "idle", type);
+  }
 });
 
 test("unmapped events emit nothing", () => {
-  for (const type of ["session.created", "session.updated", "session.deleted", "file.edited"]) {
-    assert.equal(stateForEvent(type, {}), undefined, type);
+  for (const type of [
+    "session.created",
+    "session.text.delta",
+    "session.tool.success",
+    "filesystem.changed",
+  ]) {
+    assert.equal(stateForEvent(type), undefined, type);
   }
-  assert.equal(stateForEvent("session.status", { status: "mystery" }), undefined);
-  assert.equal(stateForEvent("session.status", {}), undefined);
 });
 
 test("marker line is one greppable line", () => {
@@ -58,12 +67,11 @@ test("marker line is one greppable line", () => {
 
 test("one line per state change, monotonic seq, no escapes", () => {
   const lines = statesFor([
-    { type: "session.status", properties: { status: "busy" } },
-    { type: "tool.execute.before", properties: {} },
-    { type: "permission.asked", properties: {} },
-    { type: "question.asked", properties: {} },
-    { type: "permission.replied", properties: {} },
-    { type: "session.idle", properties: {} },
+    { type: "session.execution.started", data: { sessionID: "root" } },
+    { type: "session.tool.called", data: { sessionID: "root" } },
+    { type: "permission.asked", data: { sessionID: "root" } },
+    { type: "permission.replied", data: { sessionID: "root" } },
+    { type: "session.execution.succeeded", data: { sessionID: "root" } },
   ]);
   assert.deepEqual(
     lines.map((line) => MARKER.exec(line.trimEnd())[1]),
@@ -78,10 +86,10 @@ test("one line per state change, monotonic seq, no escapes", () => {
 
 test("subagent sessions cannot clobber the root state", () => {
   const lines = statesFor([
-    { type: "session.created", properties: { info: { id: "child", parentID: "root" } } },
-    { type: "session.status", properties: { sessionID: "child", status: "busy" } },
-    { type: "session.idle", properties: { sessionID: "child" } },
-    { type: "permission.asked", properties: { sessionID: "child" } },
+    { type: "session.created", data: { sessionID: "child", parentID: "root" } },
+    { type: "session.execution.started", data: { sessionID: "child" } },
+    { type: "session.execution.succeeded", data: { sessionID: "child" } },
+    { type: "permission.asked", data: { sessionID: "child" } },
   ]);
   assert.deepEqual(lines.map((line) => MARKER.exec(line.trimEnd())[1]), ["blocked"]);
 });
@@ -93,22 +101,33 @@ test("plugin module never touches the Herdr socket", () => {
   }
 });
 
-test("plugin default export exposes the event hook", async () => {
+test("plugin default export exposes the v2 setup hook", () => {
   assert.equal(plugin.id, "herdr.openshell-state");
-  const hooks = await plugin.server();
-  assert.equal(typeof hooks.event, "function");
+  assert.equal(typeof plugin.setup, "function");
 });
 
-test("plugin writes markers to $HOME/.herdr-state", () => {
+test("plugin writes markers to $HOME/.herdr-state via setup", () => {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "herdr-state-test-"));
   const script = `
     const { default: plugin } = await import(${JSON.stringify(pathToFileURL(PLUGIN).href)});
-    const hooks = await plugin.server();
-    for (const event of [
-      { type: "permission.asked", properties: {} },
-      { type: "session.status", properties: { status: "busy" } },
-      { type: "session.idle", properties: {} },
-    ]) await hooks.event({ event });
+    const events = [
+      { type: "permission.asked", data: { sessionID: "root" } },
+      { type: "session.execution.started", data: { sessionID: "root" } },
+      { type: "session.execution.succeeded", data: { sessionID: "root" } },
+    ];
+    const ctx = {
+      event: {
+        subscribe() {
+          return (async function* () {
+            for (const event of events) yield event;
+          })();
+        },
+      },
+    };
+    const cleanup = plugin.setup(ctx);
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    if (typeof cleanup !== "function") throw new Error("setup must return a cleanup fn");
+    cleanup();
   `;
   const run = spawnSync(process.execPath, ["--input-type=module", "-e", script], {
     env: { ...process.env, HOME: home },

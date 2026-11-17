@@ -32,19 +32,28 @@ HERDR-STATE state=<idle|working|blocked> seq=<integer>
 
 ## Event → state map (spec M2)
 
-| opencode event | state |
+This is the **opencode v2** event map. The v1 API (`server()`/`event` hook, `event.properties`,
+`session.status`, `question.*`) does **not** run in opencode v2.x — that was the original
+"always yellow" bug. Events arrive from `ctx.event.subscribe({ signal })` as
+`{ id, created, type, location, data }`.
+
+| opencode v2 event | state |
 |---|---|
-| `permission.asked`, `question.asked`, `session.error` | `blocked` |
-| `session.status` with status `active` / `busy` / `running`, `tool.execute.before`, `tool.execute.after` | `working` |
-| `session.idle`, `session.status` with status `idle` | `idle` |
-| `permission.replied`, `question.replied`, `question.rejected`, `session.compacted` | `working` |
+| `permission.asked`, `form.created`, `session.execution.failed` | `blocked` |
+| `session.execution.started`, `session.step.started`, `session.step.ended`, `session.tool.called`, `session.retry.scheduled` | `working` |
+| `session.execution.succeeded`, `session.execution.interrupted` | `idle` |
+| `permission.replied`, `form.replied`, `form.cancelled` | `working` |
 
-Nothing else emits: `session.created`, `session.updated`, `session.deleted` and unknown
-`session.status` values produce no marker, so the M1 lifecycle state stands.
+Nothing else emits: `session.created`/`updated`/`deleted`, the `*.updated` startup events
+(`integration.updated`, `provider.updated`, `model.updated`, `agent.updated`, `plugin.updated`,
+etc.), the tool/step `session.tool.*`/`session.text.*` progress events, and any unknown event
+produce no marker, so the M1 lifecycle state stands. (`session.status`/`session.idle` are
+declared in the v2 schema but have no publisher — never emitted.)
 
-Events from a subagent (child) session are ignored except `permission.asked`,
-`question.asked` and the three replied/rejected events — a subagent going idle must not flip the
-pane to `idle` while the root agent is still working.
+Events from a subagent (child) session are ignored except `permission.asked`, `form.created`
+and the three replied/cancelled events — a subagent going idle must not flip the pane to `idle`
+while the root agent is still working. A child session is recognised by `session.created`'s
+`data.parentID`.
 
 ## Reader rules (for ticket 05)
 
@@ -73,19 +82,16 @@ openshell sandbox upload <name> ./herdr-state-plugin.js /sandbox/.config/opencod
 The directory is `plugins/` (plural) for opencode v2.3.0 (matches `~/.config/opencode/plugins`
 on the host; `opencode plugin list` shows the file as a `local` plugin). Baking the file into
 the image at that path is equivalent, and is the only way to have it loaded before the agent
-starts. Plugins hot-reload when the file changes, so an upload into a running sandbox is picked
-up without a restart.
+starts. Hot-reload is unreliable: the file watcher stops under memory pressure ("location
+services evicted"), so an upload into a *running* sandbox may need an opencode restart to take
+effect.
 
 ## Verification status
 
-- Unit-tested: `node --test test/state-plugin.test.mjs` (mapping, marker format, dedupe,
-  subagent suppression, no socket use).
+- Unit-tested: `node --test test/state-plugin.test.mjs` (v2 mapping, marker format, dedupe,
+  subagent suppression, no socket use, `setup(ctx)` writes the file).
 - Live: the plugin loads inside a real sandbox (`loading plugin … role=server` in
-  `/sandbox/.local/share/opencode/log/opencode.log`) and appends to `/sandbox/.herdr-state`
-  from that process (probed with a throwaway plugin, since the marker emitter is silent until
-  the first state change).
-- **Not verified live:** a full prompt → marker cycle. The sandboxed agent in this environment
-  cannot reach a model (`credential_placement_mismatch` from `sandbox exec`, `ECONNREFUSED` to
-  `models.opencode.ai`), so no session ever produced `session.status` / `session.idle`.
-  The event→marker half is unit-tested; the runtime half needs one live run in an environment
-  with a working provider.
+  `/sandbox/.local/share/opencode/log/opencode.log`); `ctx.event.subscribe({ signal })` is the
+  correct API (probed with a throwaway plugin); and a real `opencode run "say hello"` turn
+  produced `HERDR-STATE state=working` then `HERDR-STATE state=idle` in `/sandbox/.herdr-state` —
+  a full prompt → marker cycle, confirmed end-to-end on opencode 2.3.0.
