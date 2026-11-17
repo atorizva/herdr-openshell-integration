@@ -28,6 +28,12 @@ _Avoid_: status, state.
 The Herdr state meaning the agent is waiting on the human (an approval or question).
 _Avoid_: needs input, waiting for input.
 
+**State marker**:
+The `HERDR-STATE state=… seq=…` line the in-sandbox opencode plugin writes to
+`/sandbox/.herdr-state`, the only channel that carries cognitive state out of a sandbox
+(the plugin cannot use Herdr's socket). Format: `docs/contracts/state-markers.md`.
+_Avoid_: signal, event line.
+
 **Bridge**:
 The Herdr plugin (and its detached poller) that mirrors each OpenShell sandbox into a Herdr
 pane and reports the pane's agent state.
