@@ -1,6 +1,6 @@
 id = "herdr-openshell"
 name = "herdr-openshell"
-version = "1.0.0"
+version = "1.0.1"
 min_herdr_version = "0.9.5"
 description = "Report each OpenShell sandbox's agent state in the pane it's connected to."
 platforms = ["linux", "macos"]
